@@ -1,0 +1,277 @@
+cat > /mnt/user-data/outputs/anthropic-openai-proxy/.github/workflows/run-proxy.yml << 'YAML'
+# ─── Anthropic→OpenAI Proxy — Auto-Restart Runner ─────────────────────────────
+#
+# ARCHITECTURE
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub Actions has a hard 6-hour per-job limit.
+# To work around this, we use TWO mechanisms:
+#
+#   1. Cron schedule: GitHub fires this workflow every 5.5 hours automatically.
+#      The previous run is still alive for 30 min of overlap — zero downtime.
+#
+#   2. ngrok STATIC domain: your URL never changes between restarts.
+#      Set it once in ANTHROPIC_BASE_URL and forget it.
+#
+# SETUP (do this once, in order)
+# ─────────────────────────────────────────────────────────────────────────────
+#   Step 1 — Make your repo PRIVATE (Settings → General → Danger Zone)
+#
+#   Step 2 — Add these Repository Secrets (Settings → Secrets → Actions):
+#     UPSTREAM_API_KEY    Your OpenAI/NIM/Together/etc API key
+#     NGROK_AUTHTOKEN     From https://dashboard.ngrok.com/get-started/your-authtoken
+#     NGROK_DOMAIN        Your static domain e.g. mything.ngrok-free.app
+#                         Get one free at: https://dashboard.ngrok.com/domains
+#
+#   Optional secrets:
+#     UPSTREAM_BASE_URL   Default: https://api.openai.com
+#     BIG_MODEL           Default: gpt-4o
+#     SMALL_MODEL         Default: gpt-4o-mini
+#     REASONING_MODEL     e.g. o3 (for extended thinking requests)
+#     MODEL_MAP           e.g. claude-opus-4-6=gpt-4o;claude-haiku-4-5=gpt-4o-mini
+#
+#   Step 3 — Enable the workflow:
+#     GitHub → Actions → "Run Proxy" → Enable workflow
+#
+#   Step 4 — Trigger the first run manually:
+#     GitHub → Actions → "Run Proxy" → Run workflow
+#
+#   Step 5 — Set in Claude Code (one time, permanent):
+#     export ANTHROPIC_BASE_URL=https://YOUR-STATIC-DOMAIN.ngrok-free.app
+#     export ANTHROPIC_API_KEY=dummy
+#
+# AVAILABILITY
+# ─────────────────────────────────────────────────────────────────────────────
+# With the cron firing every 5.5h, you get 4 runs/day = ~22h covered.
+# The 2h gap overnight (UTC) is when GitHub's scheduler is least reliable.
+# For ~24/7: also enable the manual dispatch trigger and re-run if you notice
+# it's down, or use a free cron service (cron-job.org) to hit the dispatch API.
+#
+# NOTE: GitHub's free tier gives public repos unlimited minutes.
+# Private repos get 2000 min/month free. GitHub Student Pack adds more.
+# Each 5.5h run = 330 min. 2000 ÷ 330 ≈ 6 runs/month on the free private tier.
+# For ~20h/day on a private repo, you WILL burn through free minutes fast.
+# → Use a PUBLIC repo (code only, no secrets — all keys go in Secrets).
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Run Proxy
+
+on:
+  # Auto-restart every 5.5 hours (330 min < 360 min hard limit)
+  # Four times a day covers ~22h. Staggered to avoid top-of-hour load spikes.
+  schedule:
+    - cron: '17 0 * * *'    # 00:17 UTC
+    - cron: '17 6 * * *'    # 06:17 UTC
+    - cron: '17 12 * * *'   # 12:17 UTC
+    - cron: '17 18 * * *'   # 18:17 UTC
+
+  # Also allow manual trigger with optional overrides
+  workflow_dispatch:
+    inputs:
+      upstream_base_url:
+        description: 'Override upstream base URL (blank = use secret)'
+        required: false
+        default: ''
+      big_model:
+        description: 'Override BIG_MODEL (e.g. gpt-4o)'
+        required: false
+        default: ''
+      small_model:
+        description: 'Override SMALL_MODEL'
+        required: false
+        default: ''
+      reasoning_model:
+        description: 'Override REASONING_MODEL (e.g. o3)'
+        required: false
+        default: ''
+
+# Prevent two runs from fighting over the same ngrok domain
+concurrency:
+  group: proxy-singleton
+  cancel-in-progress: false   # let the old one finish its slot, new one queues
+
+jobs:
+  proxy:
+    name: "Proxy Server"
+    runs-on: ubuntu-latest
+    timeout-minutes: 345    # 5h 45min — dies cleanly before GitHub's 6h kill
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Install uv ───────────────────────────────────────────────────────
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+          enable-cache: true    # cache .venv across runs for faster startup
+
+      # ── 3. Install Python deps ──────────────────────────────────────────────
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # ── 4. Install ngrok ────────────────────────────────────────────────────
+      - name: Install ngrok
+        run: |
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update -qq
+          sudo apt-get install -y ngrok
+          ngrok version
+
+      # ── 5. Configure ngrok with static domain ───────────────────────────────
+      - name: Configure ngrok
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+          NGROK_DOMAIN:    ${{ secrets.NGROK_DOMAIN }}
+        run: |
+          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+          # Write a config file so the domain is always used
+          mkdir -p ~/.config/ngrok
+          cat > ~/.config/ngrok/ngrok.yml << EOF
+          version: 3
+          agent:
+            authtoken: ${NGROK_AUTHTOKEN}
+          tunnels:
+            proxy:
+              proto: http
+              addr: 8082
+              domain: ${NGROK_DOMAIN}
+          EOF
+          echo "ngrok configured with static domain: $NGROK_DOMAIN"
+
+      # ── 6. Start proxy in background ────────────────────────────────────────
+      - name: Start proxy
+        env:
+          UPSTREAM_BASE_URL: ${{ inputs.upstream_base_url || secrets.UPSTREAM_BASE_URL || 'https://api.openai.com' }}
+          UPSTREAM_API_KEY:  ${{ secrets.UPSTREAM_API_KEY }}
+          BIG_MODEL:         ${{ inputs.big_model         || secrets.BIG_MODEL         || 'gpt-4o' }}
+          SMALL_MODEL:       ${{ inputs.small_model       || secrets.SMALL_MODEL       || 'gpt-4o-mini' }}
+          REASONING_MODEL:   ${{ inputs.reasoning_model   || secrets.REASONING_MODEL   || '' }}
+          MODEL_MAP:         ${{ secrets.MODEL_MAP || '' }}
+          PORT:              "8082"
+        run: |
+          nohup uv run uvicorn src.proxy:app \
+            --host 127.0.0.1 \
+            --port 8082 \
+            --log-level warning \
+            --workers 1 \
+            > /tmp/proxy.log 2>&1 &
+          PROXY_PID=$!
+          echo "PROXY_PID=$PROXY_PID" >> "$GITHUB_ENV"
+
+          # Wait until healthy (max 30s)
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8082/health > /dev/null 2>&1; then
+              echo "✅ Proxy healthy after ${i}s"
+              break
+            fi
+            [ $i -eq 30 ] && { echo "❌ Proxy failed to start"; cat /tmp/proxy.log; exit 1; }
+            sleep 1
+          done
+
+      # ── 7. Start ngrok tunnel ───────────────────────────────────────────────
+      - name: Start ngrok tunnel
+        env:
+          NGROK_DOMAIN: ${{ secrets.NGROK_DOMAIN }}
+        run: |
+          nohup ngrok start proxy \
+            --log stdout \
+            --log-format json \
+            > /tmp/ngrok.log 2>&1 &
+          NGROK_PID=$!
+          echo "NGROK_PID=$NGROK_PID" >> "$GITHUB_ENV"
+
+          # Wait for tunnel to establish (max 15s)
+          for i in $(seq 1 15); do
+            TUNNEL_URL=$(curl -sf http://localhost:4040/api/tunnels 2>/dev/null \
+              | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    t = next((t['public_url'] for t in d.get('tunnels',[]) if t['proto']=='https'), '')
+    print(t)
+except: pass
+" 2>/dev/null || echo "")
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Tunnel up: $TUNNEL_URL"
+              echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+              break
+            fi
+            [ $i -eq 15 ] && { echo "❌ ngrok tunnel failed"; cat /tmp/ngrok.log | head -30; exit 1; }
+            sleep 1
+          done
+
+      # ── 8. Print connection info ─────────────────────────────────────────────
+      - name: Print connection info
+        env:
+          NGROK_DOMAIN: ${{ secrets.NGROK_DOMAIN }}
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║              PROXY IS UP AND RUNNING                        ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║  URL:  https://${NGROK_DOMAIN}"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║  In your terminal (set once, works across restarts):        ║"
+          echo "║  export ANTHROPIC_BASE_URL=https://${NGROK_DOMAIN}         ║"
+          echo "║  export ANTHROPIC_API_KEY=dummy                            ║"
+          echo "║  claude                                                     ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+      # ── 9. Keep alive with health monitoring ────────────────────────────────
+      - name: Keep alive
+        env:
+          UPSTREAM_BASE_URL: ${{ inputs.upstream_base_url || secrets.UPSTREAM_BASE_URL || 'https://api.openai.com' }}
+          UPSTREAM_API_KEY:  ${{ secrets.UPSTREAM_API_KEY }}
+          BIG_MODEL:         ${{ inputs.big_model || secrets.BIG_MODEL || 'gpt-4o' }}
+          SMALL_MODEL:       ${{ inputs.small_model || secrets.SMALL_MODEL || 'gpt-4o-mini' }}
+        run: |
+          # Run for 5h 30min then exit cleanly (job timeout is 5h 45min)
+          END_TIME=$(($(date +%s) + 19800))   # 19800s = 5.5h
+          LAST_LOG_TIME=0
+          FAIL_COUNT=0
+
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 60
+
+            # Health check
+            STATUS=$(curl -sf http://127.0.0.1:8082/health 2>/dev/null && echo "OK" || echo "FAIL")
+            NOW=$(date +%s)
+
+            if [ "$STATUS" = "FAIL" ]; then
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              echo "[$(date -u +%H:%M:%S)] ⚠️  Health check failed ($FAIL_COUNT/3)"
+              if [ $FAIL_COUNT -ge 3 ]; then
+                echo "❌ Proxy down for 3 consecutive checks — restarting..."
+                pkill -f "uvicorn src.proxy" || true
+                sleep 2
+                UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL}" \
+                UPSTREAM_API_KEY="${UPSTREAM_API_KEY}" \
+                BIG_MODEL="${BIG_MODEL}" \
+                SMALL_MODEL="${SMALL_MODEL}" \
+                PORT=8082 \
+                nohup uv run uvicorn src.proxy:app \
+                  --host 127.0.0.1 --port 8082 --log-level warning \
+                  >> /tmp/proxy.log 2>&1 &
+                sleep 3
+                FAIL_COUNT=0
+              fi
+            else
+              FAIL_COUNT=0
+              # Log every 10 minutes
+              if [ $((NOW - LAST_LOG_TIME)) -ge 600 ]; then
+                REMAINING=$((END_TIME - NOW))
+                echo "[$(date -u +%H:%M:%S)] ✅ Proxy OK | ${REMAINING}s remaining until scheduled restart"
+                LAST_LOG_TIME=$NOW
+              fi
+            fi
+          done
+
+          echo "⏱️  Slot complete — workflow will be re-triggered by cron schedule"
+YAML
+echo "✅ workflow file written"
