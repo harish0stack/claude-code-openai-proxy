@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Install deps
+        run: uv sync --frozen
+
+      - name: Run unit tests
+        run: uv run pytest tests/ -v
+
+      - name: Smoke-test server startup
+        run: |
+          UPSTREAM_BASE_URL=https://api.openai.com \
+          UPSTREAM_API_KEY=dummy \
+          nohup uv run uvicorn src.proxy:app --host 127.0.0.1 --port 8082 &
+          sleep 3
+          curl -sf http://127.0.0.1:8082/health
+          curl -sf http://127.0.0.1:8082/v1/models | python3 -c "import sys,json; d=json.load(sys.stdin); assert len(d['data'])>0"
+          echo "✅ Smoke test passed"
