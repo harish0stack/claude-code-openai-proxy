@@ -109,7 +109,7 @@ jobs:
 
       # ── 3. Install Python deps ──────────────────────────────────────────────
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync
 
       # ── 4. Install ngrok ────────────────────────────────────────────────────
       - name: Install ngrok
